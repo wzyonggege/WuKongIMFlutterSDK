@@ -481,6 +481,37 @@ class MessageDB {
       endMsgSeq = oldestMsgSeq;
       startMsgSeq = 0;
     }
+    // Skip the soft-deleted range when triggering a sync. Mirrors the iOS
+    // WKChatManager.calSync deletedMessageSeqs progression (see
+    // calSync line 1287 — getDeletedMoreThan/LessThan). Without this,
+    // entering a chat after `clearMessages` (which flags is_deleted=1
+    // but keeps the rows) triggers a sync from 0; the server then
+    // replays every soft-deleted message that hasn't been filtered by
+    // channelOffsetDB, producing the "cleared but messages keep
+    // re-appearing on re-entry" bug.
+    //
+    // When the in-memory page is empty (tempList.isEmpty) and there's
+    // a soft-deleted backlog (maxDeletedSeq > 0), bump the sync window
+    // past that backlog so the server only replays seq > maxDeletedSeq
+    // (i.e. genuinely new messages received after the clear).
+    if (isSyncMsg && tempList.isEmpty && oldestMsgSeq == 0) {
+      final maxDeletedSeq =
+          await getMaxDeletedMessageSeq(channelId, channelType);
+      if (maxDeletedSeq > 0) {
+        if (pullMode == 0) {
+          // Pull-down (newest-first): server returns seq in (start, ...]
+          // — push start up to the cleared ceiling so older entries
+          // are excluded.
+          startMsgSeq = maxDeletedSeq;
+          endMsgSeq = 0;
+        } else {
+          // Pull-up (older-direction): start strictly above the cleared
+          // ceiling and let the server walk forward.
+          startMsgSeq = maxDeletedSeq + 1;
+          endMsgSeq = 0;
+        }
+      }
+    }
     if (isSyncMsg &&
         (startMsgSeq != endMsgSeq || (startMsgSeq == 0 && endMsgSeq == 0)) &&
         requestCount < 5) {
@@ -527,6 +558,31 @@ class MessageDB {
       num = WKDBConst.readInt(data, 'num');
     }
     return num;
+  }
+
+  /// Returns the highest message_seq in this channel that is soft-deleted
+  /// (is_deleted=1). Used by [getOrSyncHistoryMessages] to advance the
+  /// sync start_message_seq past the cleared range, mirroring the iOS
+  /// WKChatManager calSync deletedMessageSeqs progression. Without this,
+  /// after `clearMessages` (which only flags is_deleted=1, rows remain),
+  /// the next chat-open triggers a sync from 0 and the server replays
+  /// every soft-deleted message up to the channelOffsetDB ceiling.
+  Future<int> getMaxDeletedMessageSeq(
+      String channelID, int channelType) async {
+    String sql =
+        "select max(message_seq) message_seq from ${WKDBConst.tableMessage} where channel_id=? and channel_type=? and is_deleted=1";
+    int messageSeq = 0;
+    if (WKDBHelper.shared.getDB() == null) {
+      return messageSeq;
+    }
+    List<Map<String, Object?>> list = await WKDBHelper.shared
+        .getDB()!
+        .rawQuery(sql, [channelID, channelType]);
+    if (list.isNotEmpty) {
+      dynamic data = list[0];
+      messageSeq = WKDBConst.readInt(data, 'message_seq');
+    }
+    return messageSeq;
   }
 
   Future<int> getMsgSeq(String channelID, int channelType, int oldestOrderSeq,
